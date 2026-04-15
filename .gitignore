@@ -1,0 +1,13 @@
+
+# Claude internal state
+.omc/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Dataset (generated, not tracked)
+dataset/
+

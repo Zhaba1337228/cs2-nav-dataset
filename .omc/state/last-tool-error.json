@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd \\\"D:/AI_for_cs2/cs2_nav_dataset\\\" && git status 2>&1; echo \\\"---\\\"; gh auth status 2>&1\",\"description\":\"Check git status and GitHub auth\"}",
-  "error": "Exit code 1\nfatal: not a git repository (or any of the parent directories): .git\n---\ngithub.com\n  X Timeout trying to log in to github.com account Zhaba1337228 (keyring)\n  - Active account: true",
-  "timestamp": "2026-04-15T17:51:29.221Z",
-  "retry_count": 1
-}
