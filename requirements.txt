@@ -1,0 +1,26 @@
+# CS2 Navigation Dataset Pipeline — Dependencies
+# Python 3.11+ required
+
+# Screen capture
+mss>=9.0.0
+
+# Input hooks (keyboard + mouse)
+pynput>=1.7.6
+
+# Image processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Data processing
+pandas>=2.1.0
+pyarrow>=14.0.0
+
+# Rich console UI
+rich>=13.0.0
+
+# PyTorch (for dataset + training)
+torch>=2.1.0
+
+# Optional: for transforms in DataLoader
+# torchvision>=0.16.0
