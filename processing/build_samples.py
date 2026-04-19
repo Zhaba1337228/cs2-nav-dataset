@@ -35,12 +35,61 @@ logger = logging.getLogger("cs2_nav.build_samples")
 EVENT_COLUMNS = ["timestamp", "event_type", "key", "button", "dx", "dy"]
 
 
+def canonicalize_key_name(key: str) -> str:
+    """Map equivalent movement keys to canonical names used by labels."""
+    k = str(key).strip().lower()
+    key_aliases = {
+        "up": "w",
+        "down": "s",
+        "left": "a",
+        "right": "d",
+    }
+    return key_aliases.get(k, k)
+
+
+def infer_initial_key_states(events_df: pd.DataFrame, tracked_keys: list[str]) -> dict[str, bool]:
+    """
+    Infer key states at session start.
+
+    If the very first edge for a tracked key is `key_up`, we assume a missing
+    `key_down` happened before logging started, so key was held at t_start.
+    """
+    initial = {k: False for k in tracked_keys}
+    key_events = events_df[events_df["event_type"].isin(["key_down", "key_up"])].copy()
+    if key_events.empty:
+        return initial
+
+    key_events["key"] = key_events["key"].apply(canonicalize_key_name)
+
+    for key in tracked_keys:
+        seq = key_events[key_events["key"] == key]
+        if seq.empty:
+            continue
+        first_edge = seq.iloc[0]["event_type"]
+        if first_edge == "key_up":
+            initial[key] = True
+    return initial
+
+
 def load_events(events_path: Path) -> pd.DataFrame:
     """Load events from a session's events.csv."""
-    df = pd.read_csv(events_path, names=EVENT_COLUMNS, header=0)
+    # Read as strings first to avoid mixed-type inference warnings on noisy CSVs.
+    df = pd.read_csv(
+        events_path,
+        names=EVENT_COLUMNS,
+        header=0,
+        dtype=str,
+        low_memory=False,
+    )
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
     df["dx"] = pd.to_numeric(df["dx"], errors="coerce").fillna(0.0)
     df["dy"] = pd.to_numeric(df["dy"], errors="coerce").fillna(0.0)
+    # Normalize optional text fields after dtype=str load.
+    for col in ["event_type", "key", "button"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+    if "key" in df.columns:
+        df["key"] = df["key"].apply(canonicalize_key_name)
     df = df.dropna(subset=["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
@@ -112,6 +161,9 @@ def build_samples_for_session(
         "w": False, "a": False, "s": False, "d": False,
         "shift": False, "ctrl": False, "space": False,
     }
+    # Recover likely "missing key_down at session start" cases.
+    initial_states = infer_initial_key_states(events_df, list(key_states.keys()))
+    key_states.update(initial_states)
     mouse_button_states = {"left": False, "right": False}
 
     event_idx = 0
