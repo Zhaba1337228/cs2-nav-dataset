@@ -18,9 +18,9 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from training.model import create_model
 from training.dataset import NavigationDataset
@@ -59,10 +59,14 @@ class Trainer:
 
         # Mixed precision
         self.use_amp = config.get("use_amp", True)
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler(device="cuda", enabled=self.use_amp) if self.use_amp else None
 
         # Gradient accumulation
         self.grad_accum_steps = config.get("grad_accum_steps", 1)
+        self.max_grad_norm = float(config.get("max_grad_norm", 1.0))
+        self.label_smoothing = float(config.get("label_smoothing", 0.05))
+        self.mouse_loss = str(config.get("mouse_loss", "huber")).lower()
+        self.mouse_huber_beta = float(config.get("mouse_huber_beta", 1.0))
 
         # Loss weights
         self.loss_weights = {
@@ -76,6 +80,9 @@ class Trainer:
 
         # Metrics tracking
         self.best_val_loss = float('inf')
+        self.no_improve_epochs = 0
+        self.early_stopping_patience = int(config.get("early_stopping_patience", 12))
+        self.early_stopping_min_delta = float(config.get("early_stopping_min_delta", 1e-3))
         self.train_losses = []
         self.val_losses = []
 
@@ -105,7 +112,7 @@ class Trainer:
             targets = {k: v.to(self.device) for k, v in batch["targets"].items()}
 
             # Forward pass with mixed precision
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type="cuda", enabled=self.use_amp):
                 outputs = self.model(images)
                 loss, loss_components = self._compute_loss(outputs, targets)
                 loss = loss / self.grad_accum_steps
@@ -119,9 +126,14 @@ class Trainer:
             # Gradient accumulation
             if (batch_idx + 1) % self.grad_accum_steps == 0:
                 if self.use_amp:
+                    if self.max_grad_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                 self.optimizer.zero_grad()
 
@@ -137,6 +149,46 @@ class Trainer:
                     f"Epoch {epoch} [{batch_idx}/{len(self.train_loader)}] "
                     f"Loss: {loss.item() * self.grad_accum_steps:.4f}"
                 )
+
+        # Handle leftover gradients if number of batches is not divisible by grad_accum_steps.
+        if n_batches > 0 and (n_batches % self.grad_accum_steps) != 0:
+            if self.use_amp:
+                if self.max_grad_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        # Reduce sums across ranks to compute true global averages.
+        if dist.is_available() and dist.is_initialized():
+            stat = torch.tensor(
+                [
+                    total_loss,
+                    losses_dict["move"],
+                    losses_dict["turn"],
+                    losses_dict["jump"],
+                    losses_dict["crouch"],
+                    losses_dict["fire"],
+                    losses_dict["mouse"],
+                    float(n_batches),
+                ],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(stat, op=dist.ReduceOp.SUM)
+            total_loss = float(stat[0].item())
+            losses_dict["move"] = float(stat[1].item())
+            losses_dict["turn"] = float(stat[2].item())
+            losses_dict["jump"] = float(stat[3].item())
+            losses_dict["crouch"] = float(stat[4].item())
+            losses_dict["fire"] = float(stat[5].item())
+            losses_dict["mouse"] = float(stat[6].item())
+            n_batches = int(stat[7].item())
 
         # Average losses
         avg_loss = total_loss / max(n_batches, 1)
@@ -169,7 +221,7 @@ class Trainer:
             images = batch["images"].to(self.device)
             targets = {k: v.to(self.device) for k, v in batch["targets"].items()}
 
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type="cuda", enabled=self.use_amp):
                 outputs = self.model(images)
                 loss, loss_components = self._compute_loss(outputs, targets)
 
@@ -184,6 +236,38 @@ class Trainer:
             move_correct += (move_pred == targets["action_move"]).sum().item()
             turn_correct += (turn_pred == targets["action_turn"]).sum().item()
             total_samples += images.size(0)
+
+        # Aggregate across all ranks (each rank validates only its shard).
+        if dist.is_available() and dist.is_initialized():
+            stat = torch.tensor(
+                [
+                    total_loss,
+                    losses_dict["move"],
+                    losses_dict["turn"],
+                    losses_dict["jump"],
+                    losses_dict["crouch"],
+                    losses_dict["fire"],
+                    losses_dict["mouse"],
+                    float(n_batches),
+                    float(move_correct),
+                    float(turn_correct),
+                    float(total_samples),
+                ],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(stat, op=dist.ReduceOp.SUM)
+            total_loss = float(stat[0].item())
+            losses_dict["move"] = float(stat[1].item())
+            losses_dict["turn"] = float(stat[2].item())
+            losses_dict["jump"] = float(stat[3].item())
+            losses_dict["crouch"] = float(stat[4].item())
+            losses_dict["fire"] = float(stat[5].item())
+            losses_dict["mouse"] = float(stat[6].item())
+            n_batches = int(stat[7].item())
+            move_correct = int(stat[8].item())
+            turn_correct = int(stat[9].item())
+            total_samples = int(stat[10].item())
 
         # Average losses
         avg_loss = total_loss / max(n_batches, 1)
@@ -205,10 +289,10 @@ class Trainer:
         """Compute multi-head loss."""
         # Classification losses
         move_loss = nn.functional.cross_entropy(
-            outputs["move"], targets["action_move"].long()
+            outputs["move"], targets["action_move"].long(), label_smoothing=self.label_smoothing
         )
         turn_loss = nn.functional.cross_entropy(
-            outputs["turn"], targets["action_turn"].long()
+            outputs["turn"], targets["action_turn"].long(), label_smoothing=self.label_smoothing
         )
 
         # Binary losses
@@ -223,12 +307,20 @@ class Trainer:
         )
 
         # Mouse regression loss (MSE)
-        mouse_dx_loss = nn.functional.mse_loss(
-            outputs["mouse_dx"], targets["mouse_dx"].float()
-        )
-        mouse_dy_loss = nn.functional.mse_loss(
-            outputs["mouse_dy"], targets["mouse_dy"].float()
-        )
+        if self.mouse_loss == "mse":
+            mouse_dx_loss = nn.functional.mse_loss(outputs["mouse_dx"], targets["mouse_dx"].float())
+            mouse_dy_loss = nn.functional.mse_loss(outputs["mouse_dy"], targets["mouse_dy"].float())
+        else:
+            mouse_dx_loss = nn.functional.smooth_l1_loss(
+                outputs["mouse_dx"],
+                targets["mouse_dx"].float(),
+                beta=self.mouse_huber_beta,
+            )
+            mouse_dy_loss = nn.functional.smooth_l1_loss(
+                outputs["mouse_dy"],
+                targets["mouse_dy"].float(),
+                beta=self.mouse_huber_beta,
+            )
         mouse_loss = (mouse_dx_loss + mouse_dy_loss) / 2.0
 
         # Weighted sum
@@ -316,15 +408,40 @@ class Trainer:
                 )
 
                 # Save checkpoint
-                is_best = val_metrics['total'] < self.best_val_loss
+                is_best = val_metrics['total'] < (self.best_val_loss - self.early_stopping_min_delta)
                 if is_best:
                     self.best_val_loss = val_metrics['total']
+                    self.no_improve_epochs = 0
+                else:
+                    self.no_improve_epochs += 1
                 self.save_checkpoint(epoch, is_best=is_best)
 
                 # Save metrics
                 self.train_losses.append(train_metrics)
                 self.val_losses.append(val_metrics)
                 self._save_metrics()
+
+            # Early stopping must be synchronized across ranks to avoid DDP deadlocks.
+            stop_training = False
+            if self.is_main and self.early_stopping_patience > 0:
+                stop_training = self.no_improve_epochs >= self.early_stopping_patience
+                if stop_training:
+                    logger.info(
+                        "Early stopping triggered at epoch %d (patience=%d, min_delta=%.6f)",
+                        epoch,
+                        self.early_stopping_patience,
+                        self.early_stopping_min_delta,
+                    )
+
+            stop_tensor = torch.tensor(
+                1 if stop_training else 0,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(stop_tensor, src=0)
+            if stop_tensor.item() == 1:
+                break
 
         logger.info("Training complete!")
 
@@ -423,12 +540,33 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         weight_decay=config.get("weight_decay", 1e-4),
     )
 
-    # Scheduler
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=config.get("epochs", 100),
-        eta_min=config.get("lr_min", 1e-6),
-    )
+    # Scheduler: warmup + cosine decay tends to be much stabler on noisy imitation datasets.
+    total_epochs = int(config.get("epochs", 100))
+    warmup_epochs = int(config.get("warmup_epochs", 5))
+    warmup_epochs = max(0, min(warmup_epochs, max(total_epochs - 1, 0)))
+    if warmup_epochs > 0:
+        warmup = LinearLR(
+            optimizer,
+            start_factor=float(config.get("warmup_start_factor", 0.2)),
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_epochs - warmup_epochs),
+            eta_min=config.get("lr_min", 1e-6),
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_epochs),
+            eta_min=config.get("lr_min", 1e-6),
+        )
 
     # Create trainer
     trainer = Trainer(
@@ -443,11 +581,12 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         world_size=world_size,
     )
 
-    # Train
-    trainer.train(num_epochs=config.get("epochs", 100))
-
-    # Cleanup
-    cleanup_ddp()
+    try:
+        # Train
+        trainer.train(num_epochs=config.get("epochs", 100))
+    finally:
+        # Cleanup
+        cleanup_ddp()
 
 
 def main():
@@ -471,6 +610,14 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, nargs=2, default=[224, 224])
+    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm (<=0 disables)")
+    parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for move/turn CE loss")
+    parser.add_argument("--mouse-loss", type=str, default="huber", choices=["huber", "mse"], help="Mouse regression loss")
+    parser.add_argument("--mouse-huber-beta", type=float, default=1.0, help="Huber beta for mouse loss")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Warmup epochs before cosine decay")
+    parser.add_argument("--warmup-start-factor", type=float, default=0.2, help="Initial LR factor at warmup start")
+    parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop if val loss does not improve")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-3, help="Minimum val loss improvement")
 
     # Loss weights
     parser.add_argument("--loss-weight-move", type=float, default=1.0)

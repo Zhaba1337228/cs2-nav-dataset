@@ -82,23 +82,28 @@ class NavigationModel(nn.Module):
     def _build_backbone(self, name: str, pretrained: bool) -> tuple[nn.Module, int]:
         """Build CNN backbone and return (model, feature_dim)."""
         if name == "resnet18":
-            model = models.resnet18(pretrained=pretrained)
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            model = models.resnet18(weights=weights)
             feature_dim = model.fc.in_features
             model.fc = nn.Identity()
         elif name == "resnet34":
-            model = models.resnet34(pretrained=pretrained)
+            weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+            model = models.resnet34(weights=weights)
             feature_dim = model.fc.in_features
             model.fc = nn.Identity()
         elif name == "resnet50":
-            model = models.resnet50(pretrained=pretrained)
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            model = models.resnet50(weights=weights)
             feature_dim = model.fc.in_features
             model.fc = nn.Identity()
         elif name == "efficientnet_b0":
-            model = models.efficientnet_b0(pretrained=pretrained)
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            model = models.efficientnet_b0(weights=weights)
             feature_dim = model.classifier[1].in_features
             model.classifier = nn.Identity()
         elif name == "efficientnet_b1":
-            model = models.efficientnet_b1(pretrained=pretrained)
+            weights = models.EfficientNet_B1_Weights.DEFAULT if pretrained else None
+            model = models.efficientnet_b1(weights=weights)
             feature_dim = model.classifier[1].in_features
             model.classifier = nn.Identity()
         else:
