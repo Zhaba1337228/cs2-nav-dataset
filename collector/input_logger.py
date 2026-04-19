@@ -89,6 +89,9 @@ class InputLogger:
     def _on_key_down(self, key) -> None:
         name = self._normalize_key(key)
         with self._lock:
+            # Ignore auto-repeat key-down events while key is already held.
+            if self._key_states.get(name, False):
+                return
             self._key_states[name] = True
         event = InputEvent(
             timestamp=time.monotonic(),
@@ -101,6 +104,9 @@ class InputLogger:
     def _on_key_up(self, key) -> None:
         name = self._normalize_key(key)
         with self._lock:
+            # Ignore duplicate key-up events.
+            if not self._key_states.get(name, False):
+                return
             self._key_states[name] = False
         event = InputEvent(
             timestamp=time.monotonic(),

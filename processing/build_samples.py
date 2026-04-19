@@ -126,6 +126,9 @@ def build_samples_for_session(
         mouse_dy_sum = 0.0
         mouse_abs_dx_sum = 0.0
         mouse_abs_dy_sum = 0.0
+        # Track whether a key was active at any point during the frame interval.
+        # This avoids false "stop" labels when key transitions happen near frame boundaries.
+        frame_key_active = dict(key_states)
 
         while event_idx < n_events and events_df.iloc[event_idx]["timestamp"] < t_frame_end:
             row = events_df.iloc[event_idx]
@@ -135,9 +138,12 @@ def build_samples_for_session(
                 key = str(row["key"]).lower()
                 if key in key_states:
                     key_states[key] = True
+                    frame_key_active[key] = True
             elif etype == "key_up":
                 key = str(row["key"]).lower()
                 if key in key_states:
+                    # Key was active in this frame up until release.
+                    frame_key_active[key] = True
                     key_states[key] = False
             elif etype == "mouse_button_down":
                 btn = str(row["button"]).lower()
@@ -159,18 +165,23 @@ def build_samples_for_session(
 
         # Build sample record
         duration_ms = (t_frame_end - t_frame_start) * 1000.0
-        is_moving = key_states["w"] or key_states["a"] or key_states["s"] or key_states["d"]
+        is_moving = (
+            frame_key_active["w"]
+            or frame_key_active["a"]
+            or frame_key_active["s"]
+            or frame_key_active["d"]
+        )
         is_turning = mouse_abs_dx_sum > 3.0 or mouse_abs_dy_sum > 3.0
 
         # Build raw action name
         move_parts = []
-        if key_states["w"]:
+        if frame_key_active["w"]:
             move_parts.append("forward")
-        if key_states["s"]:
+        if frame_key_active["s"]:
             move_parts.append("back")
-        if key_states["a"]:
+        if frame_key_active["a"]:
             move_parts.append("left")
-        if key_states["d"]:
+        if frame_key_active["d"]:
             move_parts.append("right")
         raw_action = "_".join(move_parts) if move_parts else "idle"
 
@@ -184,10 +195,10 @@ def build_samples_for_session(
             image_path=f"raw_sessions/{session_id}/frames/{frame_idx:06d}.jpg",
             map_name=map_name,
             scenario_type=scenario_type,
-            key_w=1 if key_states["w"] else 0,
-            key_a=1 if key_states["a"] else 0,
-            key_s=1 if key_states["s"] else 0,
-            key_d=1 if key_states["d"] else 0,
+            key_w=1 if frame_key_active["w"] else 0,
+            key_a=1 if frame_key_active["a"] else 0,
+            key_s=1 if frame_key_active["s"] else 0,
+            key_d=1 if frame_key_active["d"] else 0,
             key_shift=1 if key_states["shift"] else 0,
             key_ctrl=1 if key_states["ctrl"] else 0,
             key_space=1 if key_states["space"] else 0,

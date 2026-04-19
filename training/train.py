@@ -43,6 +43,8 @@ class Trainer:
         scheduler: Optional[object],
         device: torch.device,
         config: dict,
+        move_class_weights: Optional[torch.Tensor] = None,
+        turn_class_weights: Optional[torch.Tensor] = None,
         rank: int = 0,
         world_size: int = 1,
     ):
@@ -56,6 +58,8 @@ class Trainer:
         self.rank = rank
         self.world_size = world_size
         self.is_main = rank == 0
+        self.move_class_weights = move_class_weights.to(device) if move_class_weights is not None else None
+        self.turn_class_weights = turn_class_weights.to(device) if turn_class_weights is not None else None
 
         # Mixed precision
         self.use_amp = config.get("use_amp", True)
@@ -289,10 +293,16 @@ class Trainer:
         """Compute multi-head loss."""
         # Classification losses
         move_loss = nn.functional.cross_entropy(
-            outputs["move"], targets["action_move"].long(), label_smoothing=self.label_smoothing
+            outputs["move"],
+            targets["action_move"].long(),
+            weight=self.move_class_weights,
+            label_smoothing=self.label_smoothing,
         )
         turn_loss = nn.functional.cross_entropy(
-            outputs["turn"], targets["action_turn"].long(), label_smoothing=self.label_smoothing
+            outputs["turn"],
+            targets["action_turn"].long(),
+            weight=self.turn_class_weights,
+            label_smoothing=self.label_smoothing,
         )
 
         # Binary losses
@@ -471,6 +481,8 @@ def cleanup_ddp() -> None:
 
 def train_worker(rank: int, world_size: int, config: dict) -> None:
     """Worker function for distributed training."""
+    config = dict(config)
+
     # Setup DDP
     setup_ddp(
         rank,
@@ -498,6 +510,27 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         image_size=tuple(config.get("image_size", [224, 224])),
         label_encoder=label_encoder,
     )
+
+    # Handle weak/noisy labels without rebuilding dataset:
+    # 1) class-weighted CE (downweight dominant "stop")
+    # 2) disable mouse regression loss if manifest has no mouse targets
+    move_class_weights = None
+    turn_class_weights = None
+    if config.get("use_class_weights", True):
+        move_class_weights = train_dataset.get_class_weights("action_move")
+        turn_class_weights = train_dataset.get_class_weights("action_turn")
+        stop_idx = label_encoder.encode_move("stop")
+        stop_scale = float(config.get("stop_class_weight_scale", 0.35))
+        if 0.0 < stop_scale < 10.0:
+            move_class_weights[stop_idx] *= stop_scale
+            move_class_weights = move_class_weights / move_class_weights.sum() * len(move_class_weights)
+
+    first_record = train_dataset._records[0] if len(train_dataset._records) > 0 else {}
+    has_mouse_targets = ("mouse_dx" in first_record) and ("mouse_dy" in first_record)
+    if not has_mouse_targets and float(config.get("loss_weight_mouse", 0.3)) > 0.0:
+        if rank == 0:
+            logger.warning("Manifest has no mouse targets. Forcing --loss-weight-mouse=0.0")
+        config["loss_weight_mouse"] = 0.0
 
     train_sampler = DistributedSampler(
         train_dataset, num_replicas=world_size, rank=rank, shuffle=True
@@ -582,6 +615,8 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         scheduler=scheduler,
         device=device,
         config=config,
+        move_class_weights=move_class_weights,
+        turn_class_weights=turn_class_weights,
         rank=rank,
         world_size=world_size,
     )
@@ -637,6 +672,18 @@ def main():
     parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs")
     parser.add_argument("--master-addr", type=str, default="127.0.0.1", help="DDP master address")
     parser.add_argument("--master-port", type=int, default=12355, help="DDP master port")
+    parser.add_argument(
+        "--use-class-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use inverse-frequency class weights for move/turn CE losses",
+    )
+    parser.add_argument(
+        "--stop-class-weight-scale",
+        type=float,
+        default=0.35,
+        help="Additional multiplier for the 'stop' class weight (lower => fewer stop predictions)",
+    )
 
     args = parser.parse_args()
 
