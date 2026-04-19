@@ -37,6 +37,7 @@ class NavigationModel(nn.Module):
         history_len: int = 1,
         use_temporal: bool = False,
         pretrained: bool = True,
+        freeze_backbone: bool = False,
         dropout: float = 0.3,
     ):
         super().__init__()
@@ -49,6 +50,9 @@ class NavigationModel(nn.Module):
 
         # Build CNN backbone
         self.backbone, feature_dim = self._build_backbone(backbone, pretrained)
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
 
         # Temporal modeling (optional)
         if self.use_temporal:
@@ -170,6 +174,7 @@ def create_model(
     history_len: int = 1,
     use_temporal: bool = False,
     pretrained: bool = True,
+    freeze_backbone: bool = False,
     dropout: float = 0.3,
 ) -> NavigationModel:
     """Factory function to create a navigation model."""
@@ -180,5 +185,6 @@ def create_model(
         history_len=history_len,
         use_temporal=use_temporal,
         pretrained=pretrained,
+        freeze_backbone=freeze_backbone,
         dropout=dropout,
     )

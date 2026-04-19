@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,67 @@ from training.dataloader_utils import collate_fn
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class AddGaussianNoise:
+    """Simple tensor noise augmentation for robustness to post-processing artifacts."""
+
+    def __init__(self, std: float = 0.01):
+        self.std = float(std)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.std <= 0:
+            return tensor
+        noise = torch.randn_like(tensor) * self.std
+        return (tensor + noise).clamp(0.0, 1.0)
+
+
+def build_transforms(config: dict):
+    """Build train/val transforms. Falls back to None if torchvision is unavailable."""
+    try:
+        from torchvision import transforms
+    except ImportError:
+        return None, None
+
+    h, w = tuple(config.get("image_size", [224, 224]))
+    train_ops = [transforms.Resize((h, w))]
+    if config.get("use_augmentation", True):
+        train_ops.extend(
+            [
+                transforms.RandomAffine(
+                    degrees=float(config.get("aug_degrees", 2.0)),
+                    translate=(
+                        float(config.get("aug_translate", 0.06)),
+                        float(config.get("aug_translate", 0.06)),
+                    ),
+                    scale=(
+                        float(config.get("aug_scale_min", 0.95)),
+                        float(config.get("aug_scale_max", 1.05)),
+                    ),
+                ),
+                transforms.ColorJitter(
+                    brightness=float(config.get("aug_brightness", 0.2)),
+                    contrast=float(config.get("aug_contrast", 0.2)),
+                    saturation=float(config.get("aug_saturation", 0.2)),
+                    hue=float(config.get("aug_hue", 0.02)),
+                ),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=int(config.get("aug_blur_kernel", 3)))],
+                    p=float(config.get("aug_blur_prob", 0.15)),
+                ),
+            ]
+        )
+    train_ops.extend(
+        [
+            transforms.ToTensor(),
+            AddGaussianNoise(std=float(config.get("aug_noise_std", 0.01))),
+        ]
+    )
+    val_ops = [
+        transforms.Resize((h, w)),
+        transforms.ToTensor(),
+    ]
+    return transforms.Compose(train_ops), transforms.Compose(val_ops)
 
 
 class Trainer:
@@ -494,12 +556,14 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
 
     # Create datasets with distributed sampler
     label_encoder = LabelEncoder()
+    train_transform, val_transform = build_transforms(config)
 
     train_dataset = NavigationDataset(
         manifest_path=config["train_manifest"],
         dataset_root=config.get("dataset_root"),
         history_len=config.get("history_len", 1),
         image_size=tuple(config.get("image_size", [224, 224])),
+        transform=train_transform,
         label_encoder=label_encoder,
     )
 
@@ -508,8 +572,36 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         dataset_root=config.get("dataset_root"),
         history_len=config.get("history_len", 1),
         image_size=tuple(config.get("image_size", [224, 224])),
+        transform=val_transform,
         label_encoder=label_encoder,
     )
+
+    # Fail fast on unknown labels: otherwise they silently map to class 0.
+    known_move = set(label_encoder.get_all_move_labels())
+    known_turn = set(label_encoder.get_all_turn_labels())
+    unknown_move = sorted(
+        {
+            rec.get("action_move", "stop")
+            for rec in train_dataset._records
+            if rec.get("action_move", "stop") not in known_move
+        }
+    )
+    unknown_turn = sorted(
+        {
+            rec.get("action_turn", "no_turn")
+            for rec in train_dataset._records
+            if rec.get("action_turn", "no_turn") not in known_turn
+        }
+    )
+    if unknown_move or unknown_turn:
+        raise ValueError(
+            "Unknown labels in train manifest. "
+            f"Unknown move={unknown_move[:10]}, unknown turn={unknown_turn[:10]}"
+        )
+
+    if rank == 0:
+        move_counts = Counter(rec.get("action_move", "stop") for rec in train_dataset._records)
+        logger.info("Train action_move top-5: %s", move_counts.most_common(5))
 
     # Handle weak/noisy labels without rebuilding dataset:
     # 1) class-weighted CE (downweight dominant "stop")
@@ -520,7 +612,11 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         move_class_weights = train_dataset.get_class_weights("action_move")
         turn_class_weights = train_dataset.get_class_weights("action_turn")
         stop_idx = label_encoder.encode_move("stop")
-        stop_scale = float(config.get("stop_class_weight_scale", 0.35))
+        stop_scale = float(config.get("stop_class_weight_scale", 0.6))
+        if stop_scale < 0.2:
+            if rank == 0:
+                logger.warning("stop_class_weight_scale=%.4f is too aggressive; clamping to 0.2", stop_scale)
+            stop_scale = 0.2
         if 0.0 < stop_scale < 10.0:
             move_class_weights[stop_idx] *= stop_scale
             move_class_weights = move_class_weights / move_class_weights.sum() * len(move_class_weights)
@@ -566,6 +662,7 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         history_len=config.get("history_len", 1),
         use_temporal=config.get("use_temporal", False),
         pretrained=config.get("pretrained", True),
+        freeze_backbone=config.get("freeze_backbone", False),
         dropout=config.get("dropout", 0.3),
     )
     model = model.to(device)
@@ -640,6 +737,12 @@ def main():
     parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet50", "efficientnet_b0", "efficientnet_b1"])
     parser.add_argument("--history-len", type=int, default=1, help="Sequence length")
     parser.add_argument("--use-temporal", action="store_true", help="Use LSTM for temporal modeling")
+    parser.add_argument(
+        "--freeze-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze CNN backbone and train only temporal/head layers",
+    )
     parser.add_argument("--dropout", type=float, default=0.3)
 
     # Training args
@@ -658,6 +761,23 @@ def main():
     parser.add_argument("--warmup-start-factor", type=float, default=0.2, help="Initial LR factor at warmup start")
     parser.add_argument("--early-stopping-patience", type=int, default=12, help="Stop if val loss does not improve")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-3, help="Minimum val loss improvement")
+    parser.add_argument(
+        "--use-augmentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable training-time visual augmentation",
+    )
+    parser.add_argument("--aug-translate", type=float, default=0.06, help="Random translation fraction for RandomAffine")
+    parser.add_argument("--aug-degrees", type=float, default=2.0, help="Random rotation degrees for RandomAffine")
+    parser.add_argument("--aug-scale-min", type=float, default=0.95, help="Minimum random scale factor")
+    parser.add_argument("--aug-scale-max", type=float, default=1.05, help="Maximum random scale factor")
+    parser.add_argument("--aug-brightness", type=float, default=0.2)
+    parser.add_argument("--aug-contrast", type=float, default=0.2)
+    parser.add_argument("--aug-saturation", type=float, default=0.2)
+    parser.add_argument("--aug-hue", type=float, default=0.02)
+    parser.add_argument("--aug-blur-prob", type=float, default=0.15)
+    parser.add_argument("--aug-blur-kernel", type=int, default=3)
+    parser.add_argument("--aug-noise-std", type=float, default=0.01)
 
     # Loss weights
     parser.add_argument("--loss-weight-move", type=float, default=1.0)
@@ -681,7 +801,7 @@ def main():
     parser.add_argument(
         "--stop-class-weight-scale",
         type=float,
-        default=0.35,
+        default=0.6,
         help="Additional multiplier for the 'stop' class weight (lower => fewer stop predictions)",
     )
 
@@ -690,6 +810,21 @@ def main():
     # Build config dict
     config = vars(args)
     config["use_amp"] = not args.no_amp
+    config["label_smoothing"] = max(0.0, min(float(config.get("label_smoothing", 0.05)), 0.2))
+    config["aug_translate"] = max(0.0, min(float(config.get("aug_translate", 0.06)), 0.3))
+    config["aug_blur_kernel"] = max(3, int(config.get("aug_blur_kernel", 3)))
+    if config["aug_blur_kernel"] % 2 == 0:
+        config["aug_blur_kernel"] += 1
+    smin = float(config.get("aug_scale_min", 0.95))
+    smax = float(config.get("aug_scale_max", 1.05))
+    if smin <= 0:
+        smin = 0.95
+    if smax < smin:
+        smax = smin
+    config["aug_scale_min"] = smin
+    config["aug_scale_max"] = smax
+    if float(config.get("stop_class_weight_scale", 0.6)) < 0.2:
+        logger.warning("Requested stop_class_weight_scale < 0.2; it will be clamped to 0.2 in workers.")
 
     # Check GPU availability
     if not torch.cuda.is_available():
