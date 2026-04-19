@@ -23,6 +23,7 @@ import sys
 import textwrap
 import time
 import urllib.request
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -113,22 +114,101 @@ def install_dependencies(
     )
 
 
-def download_file(url: str, output_path: Path, desc: str) -> None:
-    if output_path.exists():
-        print_warn(f"{output_path.name} already exists, skip download")
+def get_remote_size(url: str) -> int | None:
+    req = urllib.request.Request(url, method="HEAD")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        size_hdr = response.headers.get("Content-Length")
+        if not size_hdr:
+            return None
+        return int(size_hdr)
+
+
+def download_with_curl_resume(url: str, output_path: Path, retries: int) -> None:
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl is not installed")
+
+    for attempt in range(1, retries + 1):
+        print_info(f"curl download attempt {attempt}/{retries}: {output_path.name}")
+        # -C - enables resume support if partial file exists.
+        cmd = [
+            curl,
+            "--fail",
+            "--location",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
+            "--continue-at",
+            "-",
+            "--output",
+            str(output_path),
+            url,
+        ]
+        proc = subprocess.run(cmd, cwd=str(ROOT))
+        if proc.returncode == 0:
+            return
+        if attempt < retries:
+            wait_s = min(20, attempt * 3)
+            print_warn(f"curl attempt failed, retry in {wait_s}s")
+            time.sleep(wait_s)
+    raise RuntimeError(f"curl failed after {retries} attempts for {url}")
+
+
+def download_with_urllib(url: str, output_path: Path, retries: int) -> None:
+    for attempt in range(1, retries + 1):
+        print_info(f"urllib download attempt {attempt}/{retries}: {output_path.name}")
+        try:
+            def progress_hook(block_num: int, block_size: int, total_size: int) -> None:
+                downloaded = block_num * block_size
+                if total_size <= 0:
+                    return
+                percent = min(100.0, downloaded * 100.0 / total_size)
+                print(f"\r  {percent:6.2f}% ({downloaded // (1024 * 1024)} MB)", end="")
+
+            urllib.request.urlretrieve(url, output_path, reporthook=progress_hook)
+            print()
+            return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            print()
+            if attempt == retries:
+                raise RuntimeError(f"urllib failed after {retries} attempts for {url}") from exc
+            wait_s = min(20, attempt * 3)
+            print_warn(f"urllib attempt failed ({exc}), retry in {wait_s}s")
+            time.sleep(wait_s)
+
+
+def download_file(url: str, output_path: Path, desc: str, retries: int) -> None:
+    print_info(f"Downloading {desc} from {url}")
+    existing_size = output_path.stat().st_size if output_path.exists() else 0
+    if existing_size > 0:
+        print_warn(f"Found partial file: {output_path.name} ({existing_size // (1024 * 1024)} MB)")
+
+    remote_size = None
+    try:
+        remote_size = get_remote_size(url)
+    except Exception:
+        # Some servers/proxies may not allow HEAD; proceed anyway.
+        remote_size = None
+
+    if remote_size is not None and output_path.exists() and output_path.stat().st_size >= remote_size:
+        print_warn(f"{output_path.name} already fully downloaded, skip")
         return
 
-    print_info(f"Downloading {desc} from {url}")
+    if shutil.which("curl"):
+        download_with_curl_resume(url, output_path, retries=retries)
+    else:
+        if output_path.exists():
+            print_warn("curl not found; deleting partial file (urllib has no reliable resume)")
+            output_path.unlink()
+        download_with_urllib(url, output_path, retries=retries)
 
-    def progress_hook(block_num: int, block_size: int, total_size: int) -> None:
-        downloaded = block_num * block_size
-        if total_size <= 0:
-            return
-        percent = min(100.0, downloaded * 100.0 / total_size)
-        print(f"\r  {percent:6.2f}% ({downloaded // (1024 * 1024)} MB)", end="")
-
-    urllib.request.urlretrieve(url, output_path, reporthook=progress_hook)
-    print()
+    if remote_size is not None:
+        final_size = output_path.stat().st_size
+        if final_size != remote_size:
+            raise RuntimeError(
+                f"Downloaded size mismatch for {output_path.name}: got {final_size}, expected {remote_size}"
+            )
     print_info(f"Downloaded: {output_path}")
 
 
@@ -139,7 +219,7 @@ def extract_zip(zip_path: Path, extract_to: Path, desc: str) -> None:
     print_info(f"Extracted: {desc}")
 
 
-def ensure_dataset(server_url: str, cleanup_zips: bool) -> None:
+def ensure_dataset(server_url: str, cleanup_zips: bool, download_retries: int) -> None:
     dataset_dir = ROOT / "dataset"
     raw_sessions_dir = dataset_dir / "raw_sessions"
     manifests_dir = dataset_dir / "manifests"
@@ -153,13 +233,18 @@ def ensure_dataset(server_url: str, cleanup_zips: bool) -> None:
     raw_sessions_zip = ROOT / "raw_sessions.zip"
 
     if not manifests_dir.exists():
-        download_file(f"{server_url}/dataset.zip", dataset_zip, "dataset.zip")
+        download_file(f"{server_url}/dataset.zip", dataset_zip, "dataset.zip", retries=download_retries)
         extract_zip(dataset_zip, ROOT, "dataset.zip")
     else:
         print_warn("dataset/manifests already exists, skip dataset extraction")
 
     if not (raw_sessions_dir / "session_0001").exists():
-        download_file(f"{server_url}/raw_sessions.zip", raw_sessions_zip, "raw_sessions.zip")
+        download_file(
+            f"{server_url}/raw_sessions.zip",
+            raw_sessions_zip,
+            "raw_sessions.zip",
+            retries=download_retries,
+        )
         extract_zip(raw_sessions_zip, dataset_dir, "raw_sessions.zip")
     else:
         print_warn("dataset/raw_sessions/session_0001 already exists, skip raw sessions extraction")
@@ -242,6 +327,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-dataset", action="store_true", help="Skip dataset download/extraction")
     parser.add_argument("--server-url", default=DEFAULT_SERVER_URL, help="Dataset server base URL")
+    parser.add_argument("--download-retries", type=int, default=6, help="Download retries for dataset archives")
     parser.add_argument("--cleanup-zips", action="store_true", help="Delete downloaded zip files after extraction")
     parser.add_argument("--skip-torch", action="store_true", help="Skip explicit torch/torchvision/torchaudio install")
     parser.add_argument("--cpu-only", action="store_true", help="Install CPU-only PyTorch wheels")
@@ -284,7 +370,11 @@ def main() -> None:
     if args.skip_dataset:
         print_warn("Skipping dataset setup (flag --skip-dataset)")
     else:
-        ensure_dataset(server_url=args.server_url, cleanup_zips=args.cleanup_zips)
+        ensure_dataset(
+            server_url=args.server_url,
+            cleanup_zips=args.cleanup_zips,
+            download_retries=args.download_retries,
+        )
 
     if not args.skip_torch:
         check_torch(venv_python)
