@@ -1,13 +1,17 @@
 
 # Claude internal state
 .omc/
-
+cc.bat
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.venv/
 
 # Dataset (generated, not tracked)
 dataset/
-
+checkpoints/
+logs/
+dataset.zip
+raw_sessions.zip

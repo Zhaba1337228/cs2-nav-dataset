@@ -23,6 +23,22 @@ This project captures your CS2 gameplay (screen frames + keyboard/mouse input) a
 pip install -r requirements.txt
 ```
 
+## Ubuntu SSH One-Click Setup (Training)
+
+If you only need model training on a server (no gameplay capture), use the bootstrap installer:
+
+```bash
+bash setup_all.sh
+```
+
+This starts setup in background (`nohup`): creates `.venv`, installs training deps, installs PyTorch wheels, downloads dataset archives, and writes logs to `logs/setup_*.log`.
+
+Monitor progress:
+
+```bash
+tail -f logs/setup_*.log
+```
+
 ## Quick Start
 
 ### Record a session

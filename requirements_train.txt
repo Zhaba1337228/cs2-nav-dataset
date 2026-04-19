@@ -1,0 +1,9 @@
+# CS2 Navigation Training Profile Dependencies
+# Optimized for Ubuntu/SSH training servers (no capture hooks).
+
+numpy>=1.24.0
+Pillow>=10.0.0
+pandas>=2.1.0
+pyarrow>=14.0.0
+opencv-python>=4.8.0
+rich>=13.0.0
