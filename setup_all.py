@@ -128,26 +128,27 @@ def download_with_curl_resume(url: str, output_path: Path, retries: int) -> None
     if not curl:
         raise RuntimeError("curl is not installed")
 
+    resume_disabled = False
     for attempt in range(1, retries + 1):
         print_info(f"curl download attempt {attempt}/{retries}: {output_path.name}")
-        # -C - enables resume support if partial file exists.
-        cmd = [
-            curl,
-            "--fail",
-            "--location",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "--continue-at",
-            "-",
-            "--output",
-            str(output_path),
-            url,
-        ]
+        cmd = [curl, "--fail", "--location", "--retry", "3", "--retry-delay", "2"]
+        if not resume_disabled:
+            # -C - enables resume support if partial file exists.
+            cmd.extend(["--continue-at", "-"])
+        cmd.extend(["--output", str(output_path), url])
+
         proc = subprocess.run(cmd, cwd=str(ROOT))
         if proc.returncode == 0:
             return
+
+        # curl 33: server doesn't support byte ranges. Fallback to full download.
+        if proc.returncode == 33 and not resume_disabled:
+            print_warn("Server does not support resume (HTTP ranges). Restarting full download.")
+            if output_path.exists():
+                output_path.unlink()
+            resume_disabled = True
+            continue
+
         if attempt < retries:
             wait_s = min(20, attempt * 3)
             print_warn(f"curl attempt failed, retry in {wait_s}s")
