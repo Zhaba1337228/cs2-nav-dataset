@@ -133,6 +133,7 @@ class Trainer:
         self.label_smoothing = float(config.get("label_smoothing", 0.05))
         self.mouse_loss = str(config.get("mouse_loss", "huber")).lower()
         self.mouse_huber_beta = float(config.get("mouse_huber_beta", 1.0))
+        self.debug_shapes = bool(config.get("debug_shapes", False))
 
         # Loss weights
         self.loss_weights = {
@@ -156,6 +157,30 @@ class Trainer:
         self.checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints"))
         if self.is_main:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _select_time_step(logits: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize head output to (B, C) for classification heads.
+        Supports:
+        - (B, C): already final logits
+        - (B, T, C): take the last time step
+        """
+        if logits.ndim == 3:
+            return logits[:, -1, :]
+        return logits
+
+    @staticmethod
+    def _select_time_step_scalar(values: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize scalar/regression head output to (B,).
+        Supports:
+        - (B,)
+        - (B, T): take the last time step
+        """
+        if values.ndim == 2:
+            return values[:, -1]
+        return values
 
     def train_epoch(self, epoch: int) -> dict:
         """Train for one epoch."""
@@ -283,7 +308,7 @@ class Trainer:
         turn_correct = 0
         total_samples = 0
 
-        for batch in self.val_loader:
+        for batch_idx, batch in enumerate(self.val_loader):
             images = batch["images"].to(self.device)
             targets = {k: v.to(self.device) for k, v in batch["targets"].items()}
 
@@ -297,8 +322,18 @@ class Trainer:
             n_batches += 1
 
             # Compute accuracy
-            move_pred = outputs["move"].argmax(dim=1)
-            turn_pred = outputs["turn"].argmax(dim=1)
+            move_logits = self._select_time_step(outputs["move"])
+            turn_logits = self._select_time_step(outputs["turn"])
+            move_pred = move_logits.argmax(dim=-1)
+            turn_pred = turn_logits.argmax(dim=-1)
+            if self.debug_shapes and self.is_main and epoch == 1 and batch_idx == 0:
+                logger.info(
+                    "DEBUG shapes: move_out=%s, move_logits=%s, targets=%s, preds=%s",
+                    tuple(outputs["move"].shape),
+                    tuple(move_logits.shape),
+                    targets["action_move"][:5].tolist(),
+                    move_pred[:5].tolist(),
+                )
             move_correct += (move_pred == targets["action_move"]).sum().item()
             turn_correct += (turn_pred == targets["action_turn"]).sum().item()
             total_samples += images.size(0)
@@ -353,15 +388,23 @@ class Trainer:
 
     def _compute_loss(self, outputs: dict, targets: dict) -> tuple[torch.Tensor, dict]:
         """Compute multi-head loss."""
+        move_logits = self._select_time_step(outputs["move"])
+        turn_logits = self._select_time_step(outputs["turn"])
+        jump_logits = self._select_time_step_scalar(outputs["jump"])
+        crouch_logits = self._select_time_step_scalar(outputs["crouch"])
+        fire_logits = self._select_time_step_scalar(outputs["fire"])
+        mouse_dx_pred = self._select_time_step_scalar(outputs["mouse_dx"])
+        mouse_dy_pred = self._select_time_step_scalar(outputs["mouse_dy"])
+
         # Classification losses
         move_loss = nn.functional.cross_entropy(
-            outputs["move"],
+            move_logits,
             targets["action_move"].long(),
             weight=self.move_class_weights,
             label_smoothing=self.label_smoothing,
         )
         turn_loss = nn.functional.cross_entropy(
-            outputs["turn"],
+            turn_logits,
             targets["action_turn"].long(),
             weight=self.turn_class_weights,
             label_smoothing=self.label_smoothing,
@@ -369,27 +412,27 @@ class Trainer:
 
         # Binary losses
         jump_loss = nn.functional.binary_cross_entropy_with_logits(
-            outputs["jump"], targets["action_jump"].float()
+            jump_logits, targets["action_jump"].float()
         )
         crouch_loss = nn.functional.binary_cross_entropy_with_logits(
-            outputs["crouch"], targets["action_crouch"].float()
+            crouch_logits, targets["action_crouch"].float()
         )
         fire_loss = nn.functional.binary_cross_entropy_with_logits(
-            outputs["fire"], targets["action_fire"].float()
+            fire_logits, targets["action_fire"].float()
         )
 
         # Mouse regression loss (MSE)
         if self.mouse_loss == "mse":
-            mouse_dx_loss = nn.functional.mse_loss(outputs["mouse_dx"], targets["mouse_dx"].float())
-            mouse_dy_loss = nn.functional.mse_loss(outputs["mouse_dy"], targets["mouse_dy"].float())
+            mouse_dx_loss = nn.functional.mse_loss(mouse_dx_pred, targets["mouse_dx"].float())
+            mouse_dy_loss = nn.functional.mse_loss(mouse_dy_pred, targets["mouse_dy"].float())
         else:
             mouse_dx_loss = nn.functional.smooth_l1_loss(
-                outputs["mouse_dx"],
+                mouse_dx_pred,
                 targets["mouse_dx"].float(),
                 beta=self.mouse_huber_beta,
             )
             mouse_dy_loss = nn.functional.smooth_l1_loss(
-                outputs["mouse_dy"],
+                mouse_dy_pred,
                 targets["mouse_dy"].float(),
                 beta=self.mouse_huber_beta,
             )
@@ -778,6 +821,7 @@ def main():
     parser.add_argument("--aug-blur-prob", type=float, default=0.15)
     parser.add_argument("--aug-blur-kernel", type=int, default=3)
     parser.add_argument("--aug-noise-std", type=float, default=0.01)
+    parser.add_argument("--debug-shapes", action="store_true", help="Log first validation batch shapes/preds")
 
     # Loss weights
     parser.add_argument("--loss-weight-move", type=float, default=1.0)
