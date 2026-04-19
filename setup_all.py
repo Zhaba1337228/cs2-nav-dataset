@@ -256,6 +256,50 @@ def extract_raw_sessions_zip(zip_path: Path, root_dir: Path, dataset_dir: Path, 
     print_info("Extracted: raw_sessions.zip")
 
 
+def normalize_manifests_location(root_dir: Path, dataset_dir: Path) -> None:
+    manifests_dir = dataset_dir / "manifests"
+    train_manifest = manifests_dir / "train_manifest.jsonl"
+    val_manifest = manifests_dir / "val_manifest.jsonl"
+    if train_manifest.exists() and val_manifest.exists():
+        return
+
+    candidate_dirs = [
+        root_dir / "manifests",
+        dataset_dir / "dataset" / "manifests",
+    ]
+    # Also check shallow nested paths under project root (e.g. extracted with extra top-level folder).
+    candidate_dirs.extend([p for p in root_dir.glob("*/manifests") if p.is_dir()])
+
+    for candidate in candidate_dirs:
+        c_train = candidate / "train_manifest.jsonl"
+        c_val = candidate / "val_manifest.jsonl"
+        if c_train.exists() and c_val.exists():
+            manifests_dir.mkdir(parents=True, exist_ok=True)
+            print_warn(f"Normalizing manifests location: {candidate} -> {manifests_dir}")
+            shutil.copy2(c_train, train_manifest)
+            shutil.copy2(c_val, val_manifest)
+            return
+
+
+def extract_dataset_zip(zip_path: Path, root_dir: Path, dataset_dir: Path) -> None:
+    print_info("Extracting dataset.zip -> auto-detect destination")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        if any(n.startswith("dataset/manifests/") for n in names):
+            target = root_dir
+            reason = "archive contains dataset/manifests/*"
+        elif any(n.startswith("manifests/") for n in names):
+            target = dataset_dir
+            reason = "archive contains manifests/*"
+        else:
+            target = root_dir
+            reason = "fallback extraction to project root"
+        print_info(f"dataset.zip target: {target} ({reason})")
+        zf.extractall(target)
+    print_info("Extracted: dataset.zip")
+    normalize_manifests_location(root_dir, dataset_dir)
+
+
 def ensure_dataset(
     server_url: str,
     cleanup_zips: bool,
@@ -321,7 +365,7 @@ def ensure_dataset(
             if no_download_archives:
                 raise RuntimeError(f"dataset.zip not found locally. Expected one of: {archives_dir}, {dataset_dir}, {ROOT}")
             download_file(f"{server_url}/dataset.zip", dataset_zip, "dataset.zip", retries=download_retries)
-        extract_zip(dataset_zip, ROOT, "dataset.zip")
+        extract_dataset_zip(dataset_zip, ROOT, dataset_dir)
     else:
         print_warn("dataset/manifests already exists, skip dataset extraction")
 
@@ -343,6 +387,7 @@ def ensure_dataset(
     else:
         print_warn("dataset/raw_sessions/session_0001 already exists, skip raw sessions extraction")
 
+    normalize_manifests_location(ROOT, dataset_dir)
     train_manifest = manifests_dir / "train_manifest.jsonl"
     val_manifest = manifests_dir / "val_manifest.jsonl"
     if not train_manifest.exists() or not val_manifest.exists():
