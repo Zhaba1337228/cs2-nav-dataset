@@ -275,28 +275,44 @@ def ensure_dataset(
     (ROOT / "checkpoints").mkdir(exist_ok=True)
     (ROOT / "logs").mkdir(exist_ok=True)
 
-    dataset_zip = resolve_archive_path(
-        "dataset.zip",
-        dataset_zip_path,
-        [
-            archives_dir / "dataset.zip",
-            dataset_dir / "dataset.zip",
-            ROOT / "dataset.zip",
-            ROOT.parent / "dataset.zip",
-        ],
-        archives_dir / "dataset.zip",
-    )
-    raw_sessions_zip = resolve_archive_path(
-        "raw_sessions.zip",
-        raw_sessions_zip_path,
-        [
-            archives_dir / "raw_sessions.zip",
-            dataset_dir / "raw_sessions.zip",
-            ROOT / "raw_sessions.zip",
-            ROOT.parent / "raw_sessions.zip",
-        ],
-        archives_dir / "raw_sessions.zip",
-    )
+    archived_dataset_zip = archives_dir / "dataset.zip"
+    archived_raw_sessions_zip = archives_dir / "raw_sessions.zip"
+
+    # Strong preference for dataset/archives to avoid accidental usage of stale root copies.
+    if dataset_zip_path:
+        dataset_zip = resolve_archive_path("dataset.zip", dataset_zip_path, [], archived_dataset_zip)
+    elif archived_dataset_zip.exists():
+        dataset_zip = archived_dataset_zip
+    else:
+        dataset_zip = resolve_archive_path(
+            "dataset.zip",
+            None,
+            [
+                dataset_dir / "dataset.zip",
+                ROOT / "dataset.zip",
+                ROOT.parent / "dataset.zip",
+            ],
+            archived_dataset_zip,
+        )
+
+    if raw_sessions_zip_path:
+        raw_sessions_zip = resolve_archive_path("raw_sessions.zip", raw_sessions_zip_path, [], archived_raw_sessions_zip)
+    elif archived_raw_sessions_zip.exists():
+        raw_sessions_zip = archived_raw_sessions_zip
+    else:
+        raw_sessions_zip = resolve_archive_path(
+            "raw_sessions.zip",
+            None,
+            [
+                dataset_dir / "raw_sessions.zip",
+                ROOT / "raw_sessions.zip",
+                ROOT.parent / "raw_sessions.zip",
+            ],
+            archived_raw_sessions_zip,
+        )
+
+    print_info(f"Resolved dataset archive: {dataset_zip}")
+    print_info(f"Resolved raw sessions archive: {raw_sessions_zip}")
 
     if not manifests_dir.exists():
         if dataset_zip.exists():
