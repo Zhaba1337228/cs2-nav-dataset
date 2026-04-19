@@ -220,33 +220,110 @@ def extract_zip(zip_path: Path, extract_to: Path, desc: str) -> None:
     print_info(f"Extracted: {desc}")
 
 
-def ensure_dataset(server_url: str, cleanup_zips: bool, download_retries: int) -> None:
+def find_existing_archive(name: str, candidates: list[Path]) -> Path | None:
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def resolve_archive_path(name: str, explicit_path: str | None, candidates: list[Path], default_path: Path) -> Path:
+    if explicit_path:
+        p = Path(explicit_path).expanduser()
+        if not p.is_absolute():
+            p = (ROOT / p).resolve()
+        if p.exists() and p.is_file():
+            return p
+        raise RuntimeError(f"{name} not found at explicit path: {p}")
+    return find_existing_archive(name, candidates) or default_path
+
+
+def extract_raw_sessions_zip(zip_path: Path, root_dir: Path, dataset_dir: Path, raw_sessions_dir: Path) -> None:
+    print_info(f"Extracting raw_sessions.zip -> auto-detect destination")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        if any(n.startswith("dataset/raw_sessions/") for n in names):
+            target = root_dir
+            reason = "archive contains dataset/raw_sessions/*"
+        elif any(n.startswith("raw_sessions/") for n in names):
+            target = dataset_dir
+            reason = "archive contains raw_sessions/*"
+        else:
+            target = raw_sessions_dir
+            reason = "archive has flat structure"
+        print_info(f"raw_sessions.zip target: {target} ({reason})")
+        zf.extractall(target)
+    print_info("Extracted: raw_sessions.zip")
+
+
+def ensure_dataset(
+    server_url: str,
+    cleanup_zips: bool,
+    download_retries: int,
+    no_download_archives: bool,
+    dataset_zip_path: str | None,
+    raw_sessions_zip_path: str | None,
+) -> None:
     dataset_dir = ROOT / "dataset"
     raw_sessions_dir = dataset_dir / "raw_sessions"
     manifests_dir = dataset_dir / "manifests"
+    archives_dir = dataset_dir / "archives"
 
     dataset_dir.mkdir(exist_ok=True)
     raw_sessions_dir.mkdir(parents=True, exist_ok=True)
+    archives_dir.mkdir(parents=True, exist_ok=True)
     (ROOT / "checkpoints").mkdir(exist_ok=True)
     (ROOT / "logs").mkdir(exist_ok=True)
 
-    dataset_zip = ROOT / "dataset.zip"
-    raw_sessions_zip = ROOT / "raw_sessions.zip"
+    dataset_zip = resolve_archive_path(
+        "dataset.zip",
+        dataset_zip_path,
+        [
+            archives_dir / "dataset.zip",
+            dataset_dir / "dataset.zip",
+            ROOT / "dataset.zip",
+            ROOT.parent / "dataset.zip",
+        ],
+        archives_dir / "dataset.zip",
+    )
+    raw_sessions_zip = resolve_archive_path(
+        "raw_sessions.zip",
+        raw_sessions_zip_path,
+        [
+            archives_dir / "raw_sessions.zip",
+            dataset_dir / "raw_sessions.zip",
+            ROOT / "raw_sessions.zip",
+            ROOT.parent / "raw_sessions.zip",
+        ],
+        archives_dir / "raw_sessions.zip",
+    )
 
     if not manifests_dir.exists():
-        download_file(f"{server_url}/dataset.zip", dataset_zip, "dataset.zip", retries=download_retries)
+        if dataset_zip.exists():
+            print_warn(f"Using existing archive: {dataset_zip}")
+        else:
+            if no_download_archives:
+                raise RuntimeError(f"dataset.zip not found locally. Expected one of: {archives_dir}, {dataset_dir}, {ROOT}")
+            download_file(f"{server_url}/dataset.zip", dataset_zip, "dataset.zip", retries=download_retries)
         extract_zip(dataset_zip, ROOT, "dataset.zip")
     else:
         print_warn("dataset/manifests already exists, skip dataset extraction")
 
     if not (raw_sessions_dir / "session_0001").exists():
-        download_file(
-            f"{server_url}/raw_sessions.zip",
-            raw_sessions_zip,
-            "raw_sessions.zip",
-            retries=download_retries,
-        )
-        extract_zip(raw_sessions_zip, dataset_dir, "raw_sessions.zip")
+        if raw_sessions_zip.exists():
+            print_warn(f"Using existing archive: {raw_sessions_zip}")
+        else:
+            if no_download_archives:
+                raise RuntimeError(
+                    f"raw_sessions.zip not found locally. Expected one of: {archives_dir}, {dataset_dir}, {ROOT}"
+                )
+            download_file(
+                f"{server_url}/raw_sessions.zip",
+                raw_sessions_zip,
+                "raw_sessions.zip",
+                retries=download_retries,
+            )
+        extract_raw_sessions_zip(raw_sessions_zip, ROOT, dataset_dir, raw_sessions_dir)
     else:
         print_warn("dataset/raw_sessions/session_0001 already exists, skip raw sessions extraction")
 
@@ -329,6 +406,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-dataset", action="store_true", help="Skip dataset download/extraction")
     parser.add_argument("--server-url", default=DEFAULT_SERVER_URL, help="Dataset server base URL")
     parser.add_argument("--download-retries", type=int, default=6, help="Download retries for dataset archives")
+    parser.add_argument(
+        "--no-download-archives",
+        action="store_true",
+        help="Never download dataset archives; use only local dataset.zip/raw_sessions.zip",
+    )
+    parser.add_argument(
+        "--dataset-zip-path",
+        default=None,
+        help="Explicit path to local dataset.zip (absolute or relative to project root)",
+    )
+    parser.add_argument(
+        "--raw-sessions-zip-path",
+        default=None,
+        help="Explicit path to local raw_sessions.zip (absolute or relative to project root)",
+    )
     parser.add_argument("--cleanup-zips", action="store_true", help="Delete downloaded zip files after extraction")
     parser.add_argument("--skip-torch", action="store_true", help="Skip explicit torch/torchvision/torchaudio install")
     parser.add_argument("--cpu-only", action="store_true", help="Install CPU-only PyTorch wheels")
@@ -375,6 +467,9 @@ def main() -> None:
             server_url=args.server_url,
             cleanup_zips=args.cleanup_zips,
             download_retries=args.download_retries,
+            no_download_archives=args.no_download_archives,
+            dataset_zip_path=args.dataset_zip_path,
+            raw_sessions_zip_path=args.raw_sessions_zip_path,
         )
 
     if not args.skip_torch:

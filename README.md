@@ -39,6 +39,27 @@ Monitor progress:
 tail -f logs/setup_*.log
 ```
 
+If you already downloaded archives manually, place them in `dataset/archives/`:
+
+```text
+dataset/archives/dataset.zip
+dataset/archives/raw_sessions.zip
+```
+
+Then run installer without network downloads:
+
+```bash
+bash setup_all.sh --no-download-archives
+```
+
+If archive is already outside project root (example: `/root/raw_sessions.zip`), pass explicit paths:
+
+```bash
+bash setup_all.sh --no-download-archives \
+  --dataset-zip-path /root/cs2-nav-dataset/dataset/archives/dataset.zip \
+  --raw-sessions-zip-path /root/raw_sessions.zip
+```
+
 ## Quick Start
 
 ### Record a session
