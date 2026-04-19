@@ -25,7 +25,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from training.model import create_model
 from training.dataset import NavigationDataset
 from training.label_maps import LabelEncoder
-from training.dataloader_utils import create_dataloaders
+from training.dataloader_utils import collate_fn
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -391,6 +391,7 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         num_workers=config.get("num_workers", 4),
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
@@ -399,6 +400,7 @@ def train_worker(rank: int, world_size: int, config: dict) -> None:
         sampler=val_sampler,
         num_workers=config.get("num_workers", 4),
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     # Create model

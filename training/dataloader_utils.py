@@ -61,6 +61,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
+        collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
@@ -69,6 +70,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        collate_fn=collate_fn,
     )
 
     return train_loader, val_loader, train_dataset, val_dataset

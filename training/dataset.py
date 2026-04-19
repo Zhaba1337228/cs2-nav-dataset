@@ -98,8 +98,14 @@ class NavigationDataset(Dataset):
 
         # Get the sequence of frame indices for this sample
         session_indices = self._session_indices[session_id]
+        if local_idx < 0 or local_idx >= len(session_indices):
+            raise IndexError(
+                f"Local index out of range for session '{session_id}': {local_idx} (len={len(session_indices)})"
+            )
+
         start = max(0, local_idx - self.history_len + 1)
-        sequence_local = session_indices[start:local_idx + 1]
+        # Local indices inside this session: [start, ..., local_idx]
+        sequence_local = list(range(start, local_idx + 1))
 
         # Pad if needed (repeat first frame)
         while len(sequence_local) < self.history_len:
