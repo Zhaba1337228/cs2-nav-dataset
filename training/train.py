@@ -456,10 +456,10 @@ class Trainer:
             json.dump(metrics, f, indent=2)
 
 
-def setup_ddp(rank: int, world_size: int) -> None:
+def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: int) -> None:
     """Initialize distributed training."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = str(master_port)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -472,7 +472,12 @@ def cleanup_ddp() -> None:
 def train_worker(rank: int, world_size: int, config: dict) -> None:
     """Worker function for distributed training."""
     # Setup DDP
-    setup_ddp(rank, world_size)
+    setup_ddp(
+        rank,
+        world_size,
+        master_addr=config.get("master_addr", "127.0.0.1"),
+        master_port=int(config.get("master_port", 12355)),
+    )
     device = torch.device(f"cuda:{rank}")
 
     # Create datasets with distributed sampler
@@ -630,6 +635,8 @@ def main():
     # System args
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
     parser.add_argument("--world-size", type=int, default=2, help="Number of GPUs")
+    parser.add_argument("--master-addr", type=str, default="127.0.0.1", help="DDP master address")
+    parser.add_argument("--master-port", type=int, default=12355, help="DDP master port")
 
     args = parser.parse_args()
 
